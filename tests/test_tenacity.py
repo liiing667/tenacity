@@ -2406,5 +2406,255 @@ class TestPickle(unittest.TestCase):
         assert calls == 3
 
 
+class TestCallbackAndWaitSemantics(unittest.TestCase):
+    """Pin down attempt counts, wait sequences and callback trigger points.
+
+    These tests characterize the exact contract of the retry loop so that
+    "how many times did it run / what did the callback see" questions are
+    answered by the suite rather than by log spelunking. No wall-clock
+    sleeping is involved: the sleep callable is always injected and records
+    the durations it is asked to wait.
+    """
+
+    def _make_retrying(
+        self,
+        events: list,
+        sleeps: list,
+        **overrides: typing.Any,
+    ) -> Retrying:
+        def record(name: str) -> typing.Callable[[RetryCallState], None]:
+            def cb(retry_state: RetryCallState) -> None:
+                events.append((name, retry_state.attempt_number))
+
+            return cb
+
+        kwargs: dict[str, typing.Any] = {
+            "stop": tenacity.stop_after_attempt(3),
+            "wait": tenacity.wait_exponential(multiplier=1, max=4),
+            "retry": tenacity.retry_if_exception_type(ValueError),
+            "before": record("before"),
+            "after": record("after"),
+            "before_sleep": record("before_sleep"),
+            "sleep": sleeps.append,
+            "reraise": True,
+        }
+        kwargs.update(overrides)
+        return Retrying(**kwargs)
+
+    @staticmethod
+    def _always_failing(calls: list) -> typing.Callable[[], typing.NoReturn]:
+        def fetch() -> typing.NoReturn:
+            calls.append(1)
+            raise ValueError(f"boom-{len(calls)}")
+
+        return fetch
+
+    def test_attempt_count_and_wait_sequence(self) -> None:
+        events: list = []
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(events, sleeps)
+
+        with self.assertRaises(ValueError):
+            retrying(self._always_failing(calls))
+
+        # stop_after_attempt(3) means 3 attempts in total, not 3 retries.
+        self.assertEqual(len(calls), 3)
+        # wait_exponential(multiplier=1, max=4): the first wait equals the
+        # multiplier, then doubles; only 2 sleeps happen for 3 attempts.
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(
+            events,
+            [
+                ("before", 1),
+                ("after", 1),
+                ("before_sleep", 1),
+                ("before", 2),
+                ("after", 2),
+                ("before_sleep", 2),
+                ("before", 3),
+                ("after", 3),
+            ],
+        )
+        self.assertEqual(retrying.statistics["attempt_number"], 3)
+        self.assertEqual(retrying.statistics["idle_for"], 3)
+
+    def test_wait_exponential_caps_at_max(self) -> None:
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(
+            [], sleeps, stop=tenacity.stop_after_attempt(5)
+        )
+
+        with self.assertRaises(ValueError):
+            retrying(self._always_failing(calls))
+
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(sleeps, [1, 2, 4, 4])
+
+    def test_before_sleep_sees_current_attempt_state(self) -> None:
+        snapshots: list = []
+        sleeps: list = []
+        calls: list = []
+
+        def before_sleep(retry_state: RetryCallState) -> None:
+            assert retry_state.outcome is not None
+            assert retry_state.next_action is not None
+            snapshots.append(
+                (
+                    retry_state.attempt_number,
+                    retry_state.outcome.attempt_number,
+                    str(retry_state.outcome.exception()),
+                    retry_state.next_action.sleep,
+                    retry_state.upcoming_sleep,
+                )
+            )
+
+        retrying = self._make_retrying([], sleeps, before_sleep=before_sleep)
+
+        with self.assertRaises(ValueError):
+            retrying(self._always_failing(calls))
+
+        # The state handed to before_sleep belongs to the attempt that just
+        # failed -- never to a previous round.
+        self.assertEqual(
+            snapshots,
+            [
+                (1, 1, "boom-1", 1.0, 1),
+                (2, 2, "boom-2", 2.0, 2),
+            ],
+        )
+
+    def test_no_retry_when_exception_type_does_not_match(self) -> None:
+        events: list = []
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(
+            events,
+            sleeps,
+            retry=tenacity.retry_if_exception_type(KeyError),
+        )
+
+        with self.assertRaises(ValueError):
+            retrying(self._always_failing(calls))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+        # Only `before` fires: no retry check passes, so neither `after`
+        # nor `before_sleep` is ever invoked.
+        self.assertEqual(events, [("before", 1)])
+
+    def test_successful_call_triggers_before_only(self) -> None:
+        events: list = []
+        sleeps: list = []
+        retrying = self._make_retrying(events, sleeps)
+
+        result = retrying(lambda: "ok")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(sleeps, [])
+        self.assertEqual(events, [("before", 1)])
+
+    def test_log_callbacks_fire_expected_number_of_times(self) -> None:
+        logger = logging.getLogger(self.id())
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        handler = CapturingHandler()
+        logger.addHandler(handler)
+        calls: list = []
+        try:
+            retrying = self._make_retrying(
+                [],
+                [],
+                before=tenacity.before_log(logger, logging.INFO),
+                after=tenacity.after_log(logger, logging.INFO),
+                before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
+            )
+            with self.assertRaises(ValueError):
+                retrying(self._always_failing(calls))
+        finally:
+            logger.removeHandler(handler)
+
+        fmt = logging.Formatter().format
+        messages = [fmt(record) for record in handler.records]
+        starting = [m for m in messages if m.startswith("Starting call")]
+        finished = [m for m in messages if m.startswith("Finished call")]
+        retrying_logs = [m for m in messages if m.startswith("Retrying")]
+        self.assertEqual(len(starting), 3)
+        self.assertEqual(len(finished), 3)
+        self.assertEqual(len(retrying_logs), 2)
+        self.assertIn("1st time", starting[0])
+        self.assertIn("2nd time", starting[1])
+        self.assertIn("3rd time", starting[2])
+        self.assertIn("in 1 seconds", retrying_logs[0])
+        self.assertIn("in 2 seconds", retrying_logs[1])
+
+
+class TestTornadoCallbackSemantics(unittest.TestCase):
+    """The tornado path shares the exact same retry-loop semantics."""
+
+    def test_tornado_matches_sync_semantics(self) -> None:
+        tornado = pytest.importorskip("tornado")
+        from tornado import gen
+        from tornado import ioloop
+
+        from tenacity.tornadoweb import TornadoRetrying
+
+        events: list = []
+        sleeps: list = []
+        calls: list = []
+
+        def record(name: str) -> typing.Callable[[RetryCallState], None]:
+            def cb(retry_state: RetryCallState) -> None:
+                events.append((name, retry_state.attempt_number))
+
+            return cb
+
+        def fake_sleep(seconds: float) -> "typing.Any":
+            sleeps.append(seconds)
+            future: tornado.concurrent.Future[None] = tornado.concurrent.Future()
+            future.set_result(None)
+            return future
+
+        retrying = TornadoRetrying(
+            stop=tenacity.stop_after_attempt(3),
+            wait=tenacity.wait_exponential(multiplier=1, max=4),
+            retry=tenacity.retry_if_exception_type(ValueError),
+            before=record("before"),
+            after=record("after"),
+            before_sleep=record("before_sleep"),
+            sleep=fake_sleep,
+            reraise=True,
+        )
+
+        @gen.coroutine
+        def fetch() -> typing.Generator[typing.Any, typing.Any, typing.NoReturn]:
+            calls.append(1)
+            if False:
+                yield
+            raise ValueError(f"boom-{len(calls)}")
+
+        with self.assertRaises(ValueError):
+            ioloop.IOLoop.current().run_sync(lambda: retrying(fetch))
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(
+            events,
+            [
+                ("before", 1),
+                ("after", 1),
+                ("before_sleep", 1),
+                ("before", 2),
+                ("after", 2),
+                ("before_sleep", 2),
+                ("before", 3),
+                ("after", 3),
+            ],
+        )
+        self.assertEqual(retrying.statistics["attempt_number"], 3)
+        self.assertEqual(retrying.statistics["idle_for"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

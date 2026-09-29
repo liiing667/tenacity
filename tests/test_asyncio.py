@@ -658,5 +658,160 @@ class TestSyncFunctionWithAsyncSleep(unittest.TestCase):
         assert mock_sleep.await_count == 2
 
 
+class TestAsyncCallbackAndWaitSemantics(unittest.TestCase):
+    """Pin down the async retry loop's attempt/wait/callback contract.
+
+    Mirrors TestCallbackAndWaitSemantics in test_tenacity.py: the asyncio
+    path must behave exactly like the synchronous one. Sleeps are recorded
+    through an injected async sleep callable; nothing here waits in real
+    time.
+    """
+
+    def _make_retrying(
+        self,
+        events: list,
+        sleeps: list,
+        **overrides: Any,
+    ) -> AsyncRetrying:
+        def record(name: str) -> Callable[[RetryCallState], None]:
+            def cb(retry_state: RetryCallState) -> None:
+                events.append((name, retry_state.attempt_number))
+
+            return cb
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        kwargs: dict[str, Any] = {
+            "stop": stop_after_attempt(3),
+            "wait": tenacity.wait_exponential(multiplier=1, max=4),
+            "retry": tenacity.retry_if_exception_type(ValueError),
+            "before": record("before"),
+            "after": record("after"),
+            "before_sleep": record("before_sleep"),
+            "sleep": fake_sleep,
+            "reraise": True,
+        }
+        kwargs.update(overrides)
+        return AsyncRetrying(**kwargs)
+
+    @staticmethod
+    def _always_failing(calls: list) -> Callable[[], Any]:
+        async def fetch() -> Any:
+            calls.append(1)
+            raise ValueError(f"boom-{len(calls)}")
+
+        return fetch
+
+    @asynctest
+    async def test_attempt_count_and_wait_sequence(self) -> None:
+        events: list = []
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(events, sleeps)
+
+        with self.assertRaises(ValueError):
+            await retrying(self._always_failing(calls))
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(
+            events,
+            [
+                ("before", 1),
+                ("after", 1),
+                ("before_sleep", 1),
+                ("before", 2),
+                ("after", 2),
+                ("before_sleep", 2),
+                ("before", 3),
+                ("after", 3),
+            ],
+        )
+        self.assertEqual(retrying.statistics["attempt_number"], 3)
+        self.assertEqual(retrying.statistics["idle_for"], 3)
+
+    @asynctest
+    async def test_wait_exponential_caps_at_max(self) -> None:
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(
+            [], sleeps, stop=stop_after_attempt(5)
+        )
+
+        with self.assertRaises(ValueError):
+            await retrying(self._always_failing(calls))
+
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(sleeps, [1, 2, 4, 4])
+
+    @asynctest
+    async def test_before_sleep_sees_current_attempt_state(self) -> None:
+        snapshots: list = []
+        sleeps: list = []
+        calls: list = []
+
+        async def before_sleep(retry_state: RetryCallState) -> None:
+            assert retry_state.outcome is not None
+            assert retry_state.next_action is not None
+            snapshots.append(
+                (
+                    retry_state.attempt_number,
+                    retry_state.outcome.attempt_number,
+                    str(retry_state.outcome.exception()),
+                    retry_state.next_action.sleep,
+                    retry_state.upcoming_sleep,
+                )
+            )
+
+        retrying = self._make_retrying([], sleeps, before_sleep=before_sleep)
+
+        with self.assertRaises(ValueError):
+            await retrying(self._always_failing(calls))
+
+        # Coroutine callbacks are awaited, and the state they observe is the
+        # attempt that just failed -- never a previous round.
+        self.assertEqual(
+            snapshots,
+            [
+                (1, 1, "boom-1", 1.0, 1),
+                (2, 2, "boom-2", 2.0, 2),
+            ],
+        )
+
+    @asynctest
+    async def test_no_retry_when_exception_type_does_not_match(self) -> None:
+        events: list = []
+        sleeps: list = []
+        calls: list = []
+        retrying = self._make_retrying(
+            events,
+            sleeps,
+            retry=tenacity.retry_if_exception_type(KeyError),
+        )
+
+        with self.assertRaises(ValueError):
+            await retrying(self._always_failing(calls))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(events, [("before", 1)])
+
+    @asynctest
+    async def test_successful_call_triggers_before_only(self) -> None:
+        events: list = []
+        sleeps: list = []
+        retrying = self._make_retrying(events, sleeps)
+
+        async def fetch() -> str:
+            return "ok"
+
+        result = await retrying(fetch)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(sleeps, [])
+        self.assertEqual(events, [("before", 1)])
+
+
 if __name__ == "__main__":
     unittest.main()
